@@ -1,2 +1,6 @@
 a.out
 wdired.ll
+wdired.dSYM/
+test.txt
+wdired
+.DS_Store

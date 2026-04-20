@@ -6,6 +6,8 @@
 #include <assert.h>
 #include <dirent.h>
 #include <getopt.h>
+#include <grp.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -15,6 +17,7 @@
 #include <string.h>
 #include <sys/dirent.h>
 #include <sys/stat.h>
+#include <sys/unistd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -126,7 +129,17 @@ struct FileEntry {
         int id;
         size_t line;
         mode_t permission;
+        uid_t uid;
+        char *ownerName;
+        gid_t gid;
+        char *groupName;
         char *filename;
+        char temporaryFileName[12];
+};
+
+struct Config {
+        int dryrun;
+        char *testfile;
 };
 
 typedef bool (*ParseFn) (struct Parser *parser, struct ParseResult *result);
@@ -248,10 +261,20 @@ bool zeroOrMore (struct Parser *parser, char *chars, struct ParseResult *result)
 
 bool oneOrMore (struct Parser *parser, char *chars, struct ParseResult *result)
 {
-        size_t count = result->count;
-        zeroOrMore (parser, chars, result);
+        bool hasMatch = true;
+        bool matches  = 0;
+        while (hasMatch) {
+                hasMatch = false;
+                for (char *c = chars; *c != '\0'; c++) {
+                        if (match (parser, *c)) {
+                                writeChar (result, *c);
+                                hasMatch = true;
+                                matches += 1;
+                        }
+                }
+        }
 
-        return result->count > count;
+        return matches > 0;
 }
 
 bool oneOf (struct Parser *parser, char *chars, struct ParseResult *result)
@@ -302,12 +325,15 @@ EXACTLY (escapedSpace, "\\ ");
 CHOICE (filenameSegment, fileSafeChars, escapedSpace)
 MANY (filename, filenameSegment)
 
+ONE_OR_MORE (ownerName, FILESAFE_CHARS);
+ONE_OR_MORE (groupName, FILESAFE_CHARS);
+
 bool atEnd (struct Parser *parser)
 {
         return peek (parser) == '\0';
 }
 
-mode_t createPermissions (char *perms)
+mode_t createPermissionMask (char *perms)
 {
         mode_t permission = 0;
 
@@ -324,15 +350,35 @@ struct FileEntry parseFileEntry (struct Parser *parser, struct ParseResult *resu
 
         struct FileEntry entry;
 
-        integer (parser, result);
+        if (!integer (parser, result)) {
+                fprintf (stderr, "error: missing id in first column");
+                exit (EXIT_FAILURE);
+        }
 
         entry.id = strtol (asString (result), NULL, 10);
 
-        resetParseResult (result);
+        ignoreWhiteSpaceSeq (parser, result);
 
+        resetParseResult (result);
+        ownerName (parser, result);
+        char *owner     = asString (result);
+        entry.ownerName = alloc ((strlen (owner) + 1) * sizeof (char));
+        strcpy (entry.ownerName, owner);
+
+        ignoreWhiteSpaceSeq (parser, result);
+
+        resetParseResult (result);
+        groupName (parser, result);
+        char *group     = asString (result);
+        entry.groupName = alloc ((strlen (group) + 1) * sizeof (char));
+        strcpy (entry.groupName, group);
+
+        ignoreWhiteSpaceSeq (parser, result);
+
+        resetParseResult (result);
         permissionBits (parser, result);
 
-        entry.permission = createPermissions (asString (result));
+        entry.permission = createPermissionMask (asString (result));
 
         ignoreWhiteSpaceSeq (parser, result);
 
@@ -361,6 +407,12 @@ void destroyFileEntry (struct FileEntry *entry)
 {
         if (entry->filename)
                 free (entry->filename);
+
+        if (entry->groupName)
+                free (entry->groupName);
+
+        if (entry->ownerName)
+                free (entry->ownerName);
 }
 
 struct Parser createFileParser (FILE *fp)
@@ -419,7 +471,18 @@ struct FileEntry *readDirectory (DIR *dirp, size_t *num_entries)
                         exit (EXIT_FAILURE);
                 }
 
-                entry->permission = st.st_mode;
+                entry->permission  = st.st_mode;
+                entry->gid         = st.st_gid;
+                entry->uid         = st.st_uid;
+
+                struct passwd *pwd = getpwuid (entry->uid);
+                struct group *grp  = getgrgid (entry->gid);
+
+                entry->ownerName   = alloc ((strlen (pwd->pw_name) + 1) * sizeof (char));
+                strcpy (entry->ownerName, pwd->pw_name);
+
+                entry->groupName = alloc ((strlen (grp->gr_name) + 1) * sizeof (char));
+                strcpy (entry->groupName, grp->gr_name);
         }
 
         *num_entries = entries_count;
@@ -443,19 +506,26 @@ void writeDirectoryListing (struct FileEntry *entries, size_t entries_count, cha
         }
 
         for (int entry_idx = 0; entry_idx < entries_count; entry_idx++) {
-                struct FileEntry *currentEntry = &entries[entry_idx];
-                char rwx[]                     = {'r', 'w', 'x'};
+                struct FileEntry *current_entry = &entries[entry_idx];
+                char rwx[]                      = {'r', 'w', 'x'};
 
-                for (int i = 0; i < 9; i++) {
-                        fprintf (fp, "%d\t", i);
+                fprintf (fp, "%d\t", entry_idx);
 
-                        if (currentEntry->permission & permission_mask[i])
+                struct passwd *pwd = getpwuid (current_entry->uid);
+                struct group *grp  = getgrgid (current_entry->gid);
+
+                fprintf (fp, "%s\t", pwd->pw_name);
+
+                fprintf (fp, "%s\t", grp->gr_name);
+
+                for (int i = 0; i < 9; i++)
+                        if (current_entry->permission & permission_mask[i])
                                 fputc (rwx[i % 3], fp);
                         else
                                 fputc ('-', fp);
-                }
+
                 fputc ('\t', fp);
-                fwrite (currentEntry->filename, strlen (currentEntry->filename), 1, fp);
+                fwrite (current_entry->filename, strlen (current_entry->filename), 1, fp);
                 fputc ('\n', fp);
         }
         fclose (fp);
@@ -486,7 +556,7 @@ void launchAndWaitForEditor (char *filepath)
         }
 }
 
-void openEditor (char *dir)
+void openEditor (struct Config *config, char *dir)
 {
         DIR *dirp = opendir (dir);
 
@@ -498,7 +568,6 @@ void openEditor (char *dir)
         size_t entries_count;
 
         struct FileEntry *entries = readDirectory (dirp, &entries_count);
-
         char filepath[]           = "/tmp/wdiredXXXXXX";
 
         writeDirectoryListing (entries, entries_count, filepath);
@@ -512,40 +581,89 @@ void openEditor (char *dir)
         struct ParseResult result;
         initializeParseResult (&result);
 
-        struct FileEntry *newEntries = alloc (entries_count * sizeof (struct FileEntry));
+        struct FileEntry *new_entries = alloc (entries_count * sizeof (struct FileEntry));
 
         for (int entry_idx = 0; entry_idx < entries_count; entry_idx++)
-                newEntries[entry_idx] = parseFileEntry (&parser, &result);
+                new_entries[entry_idx] = parseFileEntry (&parser, &result);
+
+        if (config->dryrun)
+                fprintf (stderr, "Dry Run:\n");
 
         for (int entry_idx = 0; entry_idx < entries_count; entry_idx++) {
                 struct FileEntry *old_entry = &entries[entry_idx];
-                struct FileEntry fentry     = newEntries[entry_idx];
+                struct FileEntry *new_entry = &new_entries[entry_idx];
 
-                if (!fentry.filename) {
-                        if (unlinkat (dirfd (dirp), old_entry->filename, 0) < 0)
+                if (!new_entry->filename) {
+                        if (config->dryrun)
+                                fprintf (stderr, "delete: %s\n", old_entry->filename);
+                        else if (unlinkat (dirfd (dirp), old_entry->filename, 0) < 0)
                                 perror ("unlinkat");
 
                         continue;
-                } else if (strcmp (fentry.filename, old_entry->filename) != 0) {
-                        if (renameat (dirfd (dirp), old_entry->filename, dirfd (dirp), fentry.filename) < 0)
+                } else if (strcmp (new_entry->filename, old_entry->filename) != 0) {
+                        if (config->dryrun)
+                                fprintf (stderr, "rename: %s -> %s\n", old_entry->filename, new_entry->filename);
+                        else if (renameat (dirfd (dirp), old_entry->filename, dirfd (dirp), new_entry->filename) < 0)
                                 perror ("renameat");
                 }
 
-                if (old_entry->permission != fentry.permission) {
-                        if (fchmodat (dirfd (dirp), fentry.filename, fentry.permission, 0) < 0)
+                if ((old_entry->permission & 0777) != new_entry->permission) {
+                        if (config->dryrun) {
+                                fprintf (stderr,
+                                         "%s permission: %o -> %o\n",
+                                         new_entry->filename,
+                                         old_entry->permission & 0777,
+                                         new_entry->permission);
+                        } else if (fchmodat (dirfd (dirp), new_entry->filename, new_entry->permission, 0) < 0)
                                 perror ("fchmodat");
                 }
 
-                destroyFileEntry (&fentry);
+                if (strcmp (old_entry->ownerName, new_entry->ownerName) != 0 ||
+                    strcmp (old_entry->groupName, new_entry->groupName) != 0) {
+                        fchownat (dirfd (dirp), new_entry->filename, new_entry->uid, new_entry->gid, 0);
+                }
+
+                destroyFileEntry (new_entry);
         }
+
         closedir (dirp);
 }
 
 int main (int argc, char **argv)
 {
-        struct option longopts[] = {};
-        int optidx               = 0, c;
-        while ((c = getopt_long (argc, argv, "", longopts, &optidx))) {
+        struct Config config     = {.dryrun = 0, .testfile = NULL};
+        struct option longopts[] = {
+                {.name = "dryrun", .flag = &config.dryrun, .val = 1},
+                {.name = "test", .flag = NULL, .val = 'f', .has_arg = required_argument},
+                {NULL}
+        };
+        int optidx = 0, c;
+        while ((c = getopt_long (argc, argv, "f:", longopts, &optidx)) != -1) {
+                switch (c) {
+                case 0: continue;
+                case 'f': config.testfile = optarg; break;
+                default: break;
+                }
         }
-        openEditor (".");
+
+        if (config.testfile) {
+                FILE *fp = fopen (config.testfile, "r");
+
+                if (!fp) {
+                        perror ("fopen");
+                        exit (EXIT_FAILURE);
+                }
+
+                struct Parser parser = createFileParser (fp);
+                struct ParseResult result;
+                initializeParseResult (&result);
+                for (int i = 0; i < 5; i++)
+                        parseFileEntry (&parser, &result);
+
+        } else {
+                if (optind >= argc)
+                        openEditor (&config, ".");
+                else
+                        openEditor (&config, argv[optind]);
+        }
 }
